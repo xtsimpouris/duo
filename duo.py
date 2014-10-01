@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 """\
 duo -- a powerful, dynamic, pythonic interface to AWS DynamoDB
 ==============================================================
@@ -34,10 +35,12 @@ import collections
 import datetime
 import time
 import json
+import hashlib
 
 import boto
-from boto.dynamodb.item import Item as _Item
-from boto.dynamodb.exceptions import DynamoDBKeyNotFoundError
+from boto.dynamodb2.items       import Item as _Item
+from boto.dynamodb2.exceptions  import ItemNotFound
+from boto.dynamodb2.table       import Table as _Table
 
 # First off, since we have integers as one of our two native data
 # types, we're going to do enumerated types, which are great. You're
@@ -197,17 +200,27 @@ class DynamoDB(object):
             del self._connection
         self._tables.clear()
 
-    def __getitem__(self, table_name):
+    def __getitem__(self, key):
         """Retrieve a registered custom table by name.
         """
+        if isinstance(key, tuple):
+            table_name, table_model = key
+        else:
+            table_name = key
+            table_model = None
+
         if hasattr(table_name, 'table_name'):
             table_name = table_name.table_name
 
         if table_name not in self._tables:
-            self._tables[table_name] = self.connection.get_table(table_name)
+            self._tables[table_name] = _Table(table_name)
 
-        table = Table._table_types[table_name](self, self._tables[table_name], cache=self.cache)
+        if table_model:
+            table = table_model(self, self._tables[table_name], cache=self.cache)
+        else:
+            table = Table._table_types[table_name](self, self._tables[table_name], cache=self.cache)
         table.table_name = table_name
+        table.connection = self.connection
         return table
 
 
@@ -255,14 +268,23 @@ class Item(_Item):
     duo_db = None
     duo_table = None
 
-    table_name = None
     cache = None
     cache_duration = None
     is_new = False
 
     def __init__(self, *args, **kwargs):
         super(Item, self).__init__(*args, **kwargs)
-        self._original = self.copy()
+
+    def pop(self, key, default):
+        """Pops a value from the dict, and returns it
+        """
+        if key in self:
+            ret = self[key]
+            del self[key]
+        else:
+            ret = default
+
+        return ret
 
     @property
     def dynamo_key(self):
@@ -287,7 +309,7 @@ class Item(_Item):
         """
         if self.cache is not None and self.cache_duration is not None:
             table = self.duo_table
-            key = table._get_cache_key(self.hash_key, self.range_key)
+            key = table._get_cache_key(self[table.hash_key_name], self.get(table.range_key_name, None))
             duration = self.cache_duration if self.cache_duration is not None else table.cache_duration
             self.cache.set(key, self.items(), duration)
 
@@ -296,53 +318,23 @@ class Item(_Item):
         """
         if self.cache is not None:
             table = self.duo_table
-            key = table._get_cache_key(self.hash_key, self.range_key)
+            key = table._get_cache_key(self[table.hash_key_name], self.get(table.range_key_name, None))
             self.cache.delete(key)
-
-    def get_expected(self):
-        """Get a dictionary of original values for the object, with new attributes filled in w/ False.
-
-        This is useful for the `expected_value` argument to put/save.
-        """
-        expected = {}
-        for key in self.items():
-            expected[key] = False
-        expected.update(self._original)
-        return expected
 
     def put(self, *args, **kwargs):
         """Put the item in the database, and also in the cache.
         """
-        result = super(Item, self).put(*args, **kwargs)
+        result = super(Item, self).save(*args, **kwargs)
+        if not result:
+            # Den petixe i apothikefsi, i brethike allo peiragmeno item apo katw
+            # Gia ipoxrewtikki antikatastasi overwrite=True
+            return False
         self.is_new = False
         try:
             self._set_cache()
         except Exception as e:
             warnings.warn('Cache write-through failed on put(). %s: %s' % (e.__class__.__name__, e.message))
         return result
-
-    def put_conditionally(self, *args, **kwargs):
-        """Put the item in the database, but only if the original values still hold.
-        """
-        kwargs['expected_value'] = self.get_expected()
-        return self.put(*args, **kwargs)
-
-    def save(self, *args, **kwargs):
-        """Save the item in the database, and also in the cache.
-        """
-        result = super(Item, self).save(*args, **kwargs)
-        self.is_new = False
-        try:
-            self._set_cache()
-        except Exception as e:
-            warnings.warn('Cache write-through failed on save(). %s: %s' % (e.__class__.__name__, e.message))
-        return result
-
-    def save_conditionally(self, *args, **kwargs):
-        """Save the updated item in the database, but only if the original values still hold.
-        """
-        kwargs['expected_value'] = self.get_expected()
-        return self.save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
         """Delete the item from the database, and also from the cache.
@@ -414,6 +406,14 @@ class Table(object):
     def create(self, hash_key, range_key=None, **kwargs):
         """Create an item given the specified attributes.
         """
+        data = kwargs
+        data[self.hash_key_name] = hash_key
+        if self.range_key_name and range_key:
+            data[self.range_key_name] = range_key
+        # item = _Item(self.table, data = data)
+        return self._extend(Item._table_types[self.table_name](self.table, data = data), is_new=True)
+
+        """
         item = self.table.new_item(
             hash_key = hash_key,
             range_key = range_key,
@@ -421,6 +421,7 @@ class Table(object):
             item_class = Item._table_types[self.table_name],
             )
         return self._extend(item, is_new=True)
+        """
 
     def _extend(self, item, is_new=False):
         """Extend the given Item with some necessary attributes.
@@ -429,6 +430,8 @@ class Table(object):
         item.cache = self.cache
         item.duo_table = self
         item.duo_db = self.duo_db
+        item.hash_key_name = self.hash_key_name
+        item.range_key_name = self.range_key_name
         return item
 
     def _extend_iter(self, items, is_new=False):
@@ -447,7 +450,7 @@ class Table(object):
             key = '%s_%s' % (cls.cache_prefix or cls.table_name, hash_key)
         else:
             key = '%s_%s_%s' % (cls.cache_prefix or cls.table_name, hash_key, range_key)
-        return key
+        return hashlib.sha224(key).hexdigest()
 
     def _get_cache(self, hash_key, range_key=None):
         """Retrieve the specified item from the cache, if available.
@@ -459,26 +462,31 @@ class Table(object):
             cached = self.cache.get(key)
             if cached is not None:
                 # Build an Item.
-                cached = self._extend(
-                    Item._table_types[self.table_name](
-                        self.table,
-                        hash_key = hash_key,
-                        range_key = range_key,
-                        attrs = dict(cached)
-                        ))
+
+                data = dict(cached)
+                cached = self._extend(Item._table_types[self.table_name](self.table, data = data, loaded = True))
             return cached
 
-    def get_item(self, hash_key, range_key=None, **params):
-        item = self._extend(
-            self.table.get_item(
-                hash_key = hash_key,
-                range_key = range_key,
-                item_class = Item._table_types[self.table_name],
-                **params
-                )
-            )
+
+    def get_item(self, hash_key, range_key=None, consistent=False, attributes=None, **params):
+        data = {}
+        data[self.hash_key_name] = hash_key
+        if self.range_key_name and range_key:
+            data[self.range_key_name] = range_key
+
+        raw_key = self.table._encode_keys(data)
+        item_data = self.table.connection.get_item(
+            self.table_name,
+            raw_key,
+            attributes_to_get=attributes,
+            consistent_read=consistent
+        )
+        if 'Item' not in item_data:
+            raise ItemNotFound("Item (%s, %s) couldn't be found." % (hash_key, range_key))
+        item = self._extend(Item._table_types[self.table_name](self.table))
+        item.load(item_data)
         item._set_cache()
-        return item
+        return item        
 
     def __getitem__(self, key):
         if isinstance(key, tuple):
@@ -500,33 +508,32 @@ class Table(object):
                     return self.query(hash_key)
             else:
                 item = self.get_item(hash_key, range_key)
-        except DynamoDBKeyNotFoundError:
+        except ItemNotFound:
             item = self.create(hash_key, range_key)
-
-        if hasattr(item, 'is_new') and not item.is_new:
-            item._set_cache()
 
         return item
 
-    def query(self, hash_key, range_key_condition=None,
-              attributes_to_get=None, request_limit=None,
-              max_results=None, consistent_read=False,
-              scan_index_forward=True, exclusive_start_key=None):
+    def query(self, limit=None, index=None, reverse=False, consistent=False, attributes=None,
+                max_page_size=None, query_filter=None, conditional_operator=None, **filter_kwargs):
         """Perform a query on the table.
 
         Returns items using the registered subclass, if one has been registered.
 
         See http://boto.readthedocs.org/en/latest/ref/dynamodb.html#boto.dynamodb.table.Table.query
         """
-        return self._extend_iter(
-            self.table.query(hash_key, range_key_condition=range_key_condition,
-                             attributes_to_get=attributes_to_get, request_limit=request_limit,
-                             max_results=max_results, consistent_read=consistent_read,
-                             scan_index_forward=scan_index_forward, exclusive_start_key=exclusive_start_key,
-                             item_class=Item._table_types[self.table_name]))
+        return self.table.query_2(
+            limit                 = limit,
+            index                 = index,
+            reverse               = reverse,
+            consistent            = consistent,
+            attributes            = attributes,
+            max_page_size         = max_page_size,
+            query_filter          = query_filter,
+            conditional_operator  = conditional_operator,
+            **filter_kwargs
+          )
 
-    def scan(self, scan_filter=None, attributes_to_get=None, request_limit=None, max_results=None, count=False,
-             exclusive_start_key=None):
+    def scan(self, **kwargs):
         """Scan through this table.
 
         This is a very long and expensive operation, and should be avoided if at all possible.
@@ -535,10 +542,7 @@ class Table(object):
 
         See http://boto.readthedocs.org/en/latest/ref/dynamodb.html#boto.dynamodb.table.Table.scan
         """
-        return self._extend_iter(
-            self.table.scan(scan_filter=scan_filter, attributes_to_get=attributes_to_get, request_limit=request_limit,
-                            max_results=max_results, count=count, exclusive_start_key=exclusive_start_key,
-                            item_class=Item._table_types[self.table_name]))
+        return self.table.scan(**kwargs)
 
 
 class NONE(object): pass
